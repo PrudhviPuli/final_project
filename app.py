@@ -1,0 +1,161 @@
+import string
+import random
+from datetime import datetime
+from flask import Flask, g, jsonify
+from functools import wraps
+from flask import *
+import sqlite3
+
+app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect('db/belay.sqlite3')
+        db.row_factory = sqlite3.Row
+        setattr(g, '_database', db)
+    return db
+
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+
+def query_db(query, args=(), one=False):
+    db = get_db()
+    cursor = db.execute(query, args)
+    rows = cursor.fetchall()
+    db.commit()
+    cursor.close()
+    if rows:
+        if one:
+            return rows[0]
+        return rows
+    return None
+
+
+# TODO: If your app sends users to any other routes, include them here.
+#       (This should not be necessary).
+@app.route('/')
+@app.route('/belay')
+@app.route('/login')
+@app.route('/signup')
+@app.route('/update')
+@app.route('/channel/<channel_id>')
+def index(channel_id=None):
+    return app.send_static_file('index.html')
+
+def validate_user_api_key(req):
+    api_key = req.headers['Api-Key']
+    if api_key:
+        return query_db('select * from users where api_key = ?', [api_key], one=True)
+    return None
+
+@app.route('/api/login', methods = ['POST'])
+def login():
+    if request.method == 'POST':
+        userName = request.headers['userName']
+        password = request.headers['password']
+        user = query_db('SELECT id, api_key, name FROM users WHERE name = ? AND password = ?', [userName, password], one=True)
+        
+        if not user:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        return jsonify({'api_key': user['api_key'], 'user_id': user['id'], 'user_name': user['name']}), 200
+    
+    return jsonify({'error': 'Method Not Allowed'}), 405
+
+@app.route('/api/signup/details', methods = ['POST'])
+def signup_details():
+    if request.method == 'POST':
+        userName = request.headers['userName']
+        password = request.headers['password']
+        api_key = ''.join(random.choices(string.ascii_lowercase + string.digits, k=40))
+        user = query_db('insert into users (name, password, api_key) values (?, ?, ?) returning id, name, password, api_key',
+                            (userName, password, api_key), one=True)
+        
+        if not user:
+            return jsonify({'error': 'Failed to signup'}), 401
+        
+        return jsonify({'api_key': user['api_key'], 'user_id': user['id'], 'user_name': user['name']}), 200
+    
+    return jsonify({'error': 'Method Not Allowed'}), 405
+
+@app.route('/api/room/messages', methods=['GET'])
+def get_all_messages():
+    out = {'allM': []}
+    user = validate_user_api_key(request)
+    if not user:
+        return app.send_static_file('404.html'), 401
+    if request.method == 'GET':
+        room_id = request.args['room_id']
+        msgs = query_db('select m.id, u.name, m.body from messages m, users u '
+                       'where m.channel_id = ? and m.user_id = u.id order by m.id', [room_id], one=False)
+        if not msgs:
+            return out
+        msgsList = []
+        for msg in msgs:
+            msgsList.append({'id': msg[0], 'name': msg[1], 'body': msg[2]})
+        out['allM'] = msgsList
+    return out, 200
+
+@app.route('/api/rooms', methods=['GET'])
+def get_all_rooms():
+    out = {'allC': []}
+    user = validate_user_api_key(request)
+    if not user:
+        return app.send_static_file('404.html'), 401
+    if request.method == 'GET':
+        rooms = query_db('select * from channels')
+        print(rooms)
+        roomsList = []
+        if rooms is not None:
+            for msg in rooms:
+                roomsList.append({'id': msg['id'], 'name': msg['channel_name']})
+        out['allC'] = roomsList
+    return out, 200
+
+@app.route('/api/room/post', methods=['POST'])
+def post_message():
+    user = validate_user_api_key(request)
+    if not user:
+        return app.send_static_file('404.html'), 401
+    if request.method == 'POST':
+        u = query_db('insert into messages (user_id, channel_id, body) ' + 
+            'values (?, ?, ?) returning id, user_id, channel_id, body',
+            (request.headers['User-Id'], request.args['room_id'], request.args['body']), one=True)
+        return {'status': 'Success'}, 200
+
+
+@app.route('/api/update/username', methods=['POST'])
+def update_username():
+    user = validate_user_api_key(request)
+    if not user:
+        return app.send_static_file('404.html'), 401
+    
+    if request.method == 'POST':
+        temp = query_db('update users set name = ? where api_key = ? returning id, name',
+            (request.args['user_name'], request.headers['Api-Key']),
+            one=True
+        )
+        return {'name': temp['name']}
+    return {}
+
+@app.route('/api/update/password', methods=['POST'])
+def update_password():
+    user = validate_user_api_key(request)
+    if not user:
+        return app.send_static_file('404.html'), 401
+    
+    if request.method == 'POST':
+        temp = query_db('update users set password = ? where api_key = ? returning id, name',
+            (request.headers['password'], request.headers['Api-Key']),
+            one=True
+        )
+        return {}, 200
+    return {'Status': 'Failed for Unknown Reasons'}, 403
